@@ -1,3 +1,27 @@
+# Health check server class
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+    
+    def log_message(self, format, *args):
+        # Suppress log messages from health check requests
+        return
+
+# Start health check server in a separate thread
+def start_health_server():
+    server = HTTPServer(('0.0.0.0', HEALTH_CHECK_PORT), HealthCheckHandler)
+    logger.info(f"Starting health check server on port {HEALTH_CHECK_PORT}")
+    server.serve_forever()
+
 import os
 import logging
 import yt_dlp
@@ -5,6 +29,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
 from io import BytesIO
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Enable logging
 logging.basicConfig(
@@ -12,8 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Get token from environment variable
+# Configuration
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+HEALTH_CHECK_PORT = int(os.environ.get("PORT", 8080))  # Default to 8080 if not specified
 
 # Welcome message with emojis
 WELCOME_MESSAGE = """
@@ -183,6 +210,11 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(button_callback))
+
+    # Start health check server in a separate thread
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    logger.info(f"Health check server running on port {HEALTH_CHECK_PORT}")
 
     # Run the bot
     application.run_polling(allowed_updates=Update.ALL_TYPES)
