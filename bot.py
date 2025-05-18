@@ -7,6 +7,8 @@ from io import BytesIO
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import time
+import httpx
 
 # Enable logging
 logging.basicConfig(
@@ -16,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    logger.error("No TELEGRAM_BOT_TOKEN environment variable found. Bot cannot start.")
+    
 HEALTH_CHECK_PORT = int(os.environ.get("PORT", 8080))  # Default to 8080 if not specified
 
 # Welcome message with emojis
@@ -64,34 +69,39 @@ def start_health_server():
 
 # Function to search YouTube for music
 async def search_youtube(query, max_results=5):
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'bestaudio/best',
-        'default_search': 'ytsearch',
-        'noplaylist': True,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-    }
-    
-    search_query = f"ytsearch{max_results}:{query}"
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(search_query, download=False)
-        results = []
-        if 'entries' in info:
-            for entry in info['entries']:
-                if entry:
-                    results.append({
-                        'title': entry.get('title', 'Unknown'),
-                        'duration': entry.get('duration', 0),
-                        'url': entry.get('webpage_url', ''),
-                        'id': entry.get('id', '')
-                    })
-        return results
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'bestaudio/best',
+            'default_search': 'ytsearch',
+            'noplaylist': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'socket_timeout': 15,  # Add timeout
+        }
+        
+        search_query = f"ytsearch{max_results}:{query}"
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(search_query, download=False)
+            results = []
+            if 'entries' in info:
+                for entry in info['entries']:
+                    if entry:
+                        results.append({
+                            'title': entry.get('title', 'Unknown'),
+                            'duration': entry.get('duration', 0),
+                            'url': entry.get('webpage_url', ''),
+                            'id': entry.get('id', '')
+                        })
+            return results
+    except Exception as e:
+        logger.error(f"Error in search_youtube: {e}")
+        return []
 
 # Function to download a YouTube video as MP3
 async def download_youtube_audio(url):
@@ -99,23 +109,28 @@ async def download_youtube_audio(url):
     buffer = BytesIO()
     
     def download_to_buffer():
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': '-',
-            'quiet': True,
-            'no_warnings': True,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'music')
-            ydl.download([url])
-            return title, buffer.getvalue()
+        try:
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': '-',
+                'quiet': True,
+                'no_warnings': True,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'socket_timeout': 30,  # Add timeout
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = info.get('title', 'music')
+                ydl.download([url])
+                return title, buffer.getvalue()
+        except Exception as e:
+            logger.error(f"Error in download_to_buffer: {e}")
+            return None, None
     
     try:
         title, audio_data = await loop.run_in_executor(None, download_to_buffer)
@@ -129,18 +144,31 @@ async def start(update: Update, context: CallbackContext) -> None:
     """Send welcome message and image when the command /start is issued."""
     user = update.effective_user
     
-    # Send welcome image
-    with open('welcome.jpg', 'rb') as photo:
-        await update.message.reply_photo(
-            photo=photo,
-            caption=f"👋 Hello {user.first_name}!"
+    try:
+        # Send welcome image
+        try:
+            with open('welcome.jpg', 'rb') as photo:
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption=f"👋 Hello {user.first_name}!"
+                )
+        except FileNotFoundError:
+            logger.error("welcome.jpg not found")
+            await update.message.reply_text(f"👋 Hello {user.first_name}!")
+        
+        # Send welcome message
+        await update.message.reply_text(
+            WELCOME_MESSAGE,
+            parse_mode='Markdown'
         )
-    
-    # Send welcome message
-    await update.message.reply_text(
-        WELCOME_MESSAGE,
-        parse_mode='Markdown'
-    )
+    except Exception as e:
+        logger.error(f"Error in start command: {e}")
+        try:
+            await update.message.reply_text(
+                "👋 Welcome to Music Downloader Bot! Send me a song name to download music."
+            )
+        except Exception as inner_e:
+            logger.error(f"Failed to send fallback message: {inner_e}")
 
 # Help command handler
 async def help_command(update: Update, context: CallbackContext) -> None:
@@ -202,22 +230,30 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
 
 def main() -> None:
     """Start the bot."""
-    # Create the Application
-    application = Application.builder().token(TOKEN).build()
+    try:
+        # Create the Application with increased connection pool and timeouts
+        application = Application.builder().token(TOKEN).http_version("1.1").get_updates_connection_pool_size(8).connection_pool_size(16).build()
 
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(button_callback))
+        # Add handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_handler(CallbackQueryHandler(button_callback))
 
-    # Start health check server in a separate thread
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
-    logger.info(f"Health check server running on port {HEALTH_CHECK_PORT}")
+        # Start health check server in a separate thread
+        health_thread = threading.Thread(target=start_health_server, daemon=True)
+        health_thread.start()
+        logger.info(f"Health check server running on port {HEALTH_CHECK_PORT}")
 
-    # Run the bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Run the bot with proper error handling
+        logger.info("Starting the bot...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=60, read_timeout=60, write_timeout=60, connect_timeout=60, pool_timeout=60)
+    except Exception as e:
+        logger.error(f"Error in main function: {e}")
+        # Wait a bit before restarting to avoid rapid restarts
+        time.sleep(10)
+        # Try again - Koyeb will restart the container if it keeps failing
+        main()
 
 if __name__ == "__main__":
     main()
